@@ -1,0 +1,250 @@
+rules_version = '2';
+
+// Rasoi Hisaab security rules.
+// Core idea: every document carries `userId`, and a write is only accepted when
+// request.auth.uid == userId (for new data) and == resource.data.userId (for existing data).
+// Every write must also create a matching, immutable audit record in the SAME batch.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+    function isMember() {
+      return signedIn() && request.auth.uid in ['shiv', 'chavi', 'upasana', 'shristi', 'payal'];
+    }
+    function isMemberId(u) {
+      return u in ['shiv', 'chavi', 'upasana', 'shristi', 'payal'];
+    }
+    // New data must belong to the caller.
+    function ownsNew() {
+      return request.resource.data.userId == request.auth.uid;
+    }
+    // Existing data must belong to the caller.
+    function ownsOld() {
+      return resource.data.userId == request.auth.uid;
+    }
+    function isTask(t) {
+      return t in ['aata', 'roti', 'kaatna', 'sabji', 'bartan'];
+    }
+    function isDate(s) {
+      return s is string && s.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+    // 00:00 IST of a "YYYY-MM-DD" date (IST = UTC+5:30).
+    function dayStart(s) {
+      let p = s.split('-');
+      return timestamp.date(int(p[0]), int(p[1]), int(p[2])) - duration.value(330, 'm');
+    }
+    // Entries can be written up to 15 days ahead (planning) and until 24h after their day ends.
+    function editable(s) {
+      return request.time < dayStart(s) + duration.value(48, 'h')
+        && request.time > dayStart(s) - duration.value(15, 'd');
+    }
+    function intIn(x, lo, hi) {
+      return x is int && x >= lo && x <= hi;
+    }
+    function numIn(x, lo, hi) {
+      return (x is int || x is float) && x >= lo && x <= hi;
+    }
+
+    // ---------- audit coupling ----------
+    function auditPath() {
+      return /databases/$(database)/documents/audit/$(request.resource.data.lastAuditId);
+    }
+    // The batch must create a NEW audit doc (it did not exist before) that records
+    // exactly this write: same actor, same document, exact old and new values.
+    function audited(coll, id, before) {
+      let a = getAfter(auditPath()).data;
+      return request.resource.data.lastAuditId is string
+        && !exists(auditPath())
+        && a.userId == request.auth.uid
+        && a.coll == coll
+        && a.docId == id
+        && a.before == before
+        && a.after == request.resource.data;
+    }
+    function auditedCreate(coll, id) {
+      return audited(coll, id, null);
+    }
+    function auditedUpdate(coll, id) {
+      return audited(coll, id, resource.data);
+    }
+
+    // ---------- members (profile) ----------
+    // Created only by the seed script (Admin SDK bypasses rules).
+    match /members/{uid} {
+      allow read: if isMember();
+      allow create, delete: if false;
+      allow update: if isMember()
+        && request.auth.uid == uid
+        && ownsOld() && ownsNew()
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['usualRotisWeekday', 'usualRotisWeekend', 'notifications', 'lastAuditId'])
+        && intIn(request.resource.data.usualRotisWeekday, 0, 30)
+        && intIn(request.resource.data.usualRotisWeekend, 0, 30)
+        && request.resource.data.notifications is bool
+        && auditedUpdate('members', uid);
+    }
+
+    // ---------- entries: one per person per session ----------
+    // id = "<date>_<meal>_<uid>", e.g. "2026-11-14_wd_shiv"
+    function validEntry(entryId) {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['userId', 'sessionId', 'date', 'meal', 'rotisPlanned', 'rotisEaten',
+                               'away', 'tasksDone', 'rotisMade', 'lastAuditId'])
+        && d.keys().hasAll(['userId', 'sessionId', 'date', 'meal', 'rotisPlanned', 'rotisEaten',
+                            'away', 'tasksDone', 'rotisMade', 'lastAuditId'])
+        && isDate(d.date)
+        && d.meal in ['wd', 'b', 'l', 'd']
+        && d.sessionId == d.date + '_' + d.meal
+        && entryId == d.sessionId + '_' + request.auth.uid
+        && intIn(d.rotisPlanned, 0, 30)
+        && (d.rotisEaten == null || intIn(d.rotisEaten, 0, 30))
+        && d.away is bool
+        && d.tasksDone is list
+        && d.tasksDone.size() <= 5
+        && d.tasksDone.hasOnly(['aata', 'roti', 'kaatna', 'sabji', 'bartan'])
+        && intIn(d.rotisMade, 0, 150)
+        // you cannot claim work for a day that has not started yet
+        && (d.tasksDone.size() == 0 || request.time >= dayStart(d.date));
+    }
+    match /entries/{entryId} {
+      allow read: if isMember();
+      allow create: if isMember() && ownsNew() && validEntry(entryId)
+        && editable(request.resource.data.date)
+        && auditedCreate('entries', entryId);
+      allow update: if isMember() && ownsOld() && ownsNew() && validEntry(entryId)
+        && request.resource.data.sessionId == resource.data.sessionId
+        && editable(resource.data.date)
+        && auditedUpdate('entries', entryId);
+      allow delete: if false;
+    }
+
+    // ---------- swaps: A asks, B answers from B's own login ----------
+    match /swaps/{swapId} {
+      allow read: if isMember();
+      allow create: if isMember() && ownsNew()
+        && request.resource.data.keys().hasOnly(['userId', 'toUid', 'sessionId', 'date', 'task', 'giveBack', 'status', 'lastAuditId'])
+        && isMemberId(request.resource.data.toUid)
+        && request.resource.data.toUid != request.auth.uid
+        && isDate(request.resource.data.date)
+        && request.resource.data.sessionId.matches('^' + request.resource.data.date + '_(wd|b|l|d)$')
+        && isTask(request.resource.data.task)
+        && (request.resource.data.giveBack == null || isTask(request.resource.data.giveBack))
+        && request.resource.data.status == 'pending'
+        && editable(request.resource.data.date)
+        && auditedCreate('swaps', swapId);
+      // Requester may only cancel, and only while nobody has answered.
+      allow update: if isMember() && ownsOld() && ownsNew()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'lastAuditId'])
+        && resource.data.status == 'pending'
+        && request.resource.data.status == 'cancelled'
+        && !exists(/databases/$(database)/documents/swapReplies/$(swapId))
+        && auditedUpdate('swaps', swapId);
+      allow delete: if false;
+    }
+    // The answer is B's own document (userId = B). Doc id = swap id, so only one answer ever.
+    match /swapReplies/{swapId} {
+      allow read: if isMember();
+      allow create: if isMember() && ownsNew()
+        && request.resource.data.keys().hasOnly(['userId', 'swapId', 'date', 'accept', 'lastAuditId'])
+        && request.resource.data.swapId == swapId
+        && request.resource.data.accept is bool
+        && get(/databases/$(database)/documents/swaps/$(swapId)).data.toUid == request.auth.uid
+        && get(/databases/$(database)/documents/swaps/$(swapId)).data.status == 'pending'
+        && request.resource.data.date == get(/databases/$(database)/documents/swaps/$(swapId)).data.date
+        && editable(request.resource.data.date)
+        && auditedCreate('swapReplies', swapId);
+      allow update, delete: if false;
+    }
+
+    // ---------- flags / dispute comments: raise only, never edit or delete ----------
+    match /flags/{flagId} {
+      allow read: if isMember();
+      allow create: if isMember() && ownsNew()
+        && request.resource.data.keys().hasOnly(['userId', 'targetUid', 'sessionId', 'date', 'text', 'lastAuditId'])
+        && isMemberId(request.resource.data.targetUid)
+        && isDate(request.resource.data.date)
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 300
+        && auditedCreate('flags', flagId);
+      allow update, delete: if false;
+    }
+
+    // ---------- group vote on point values ----------
+    function validValues(v) {
+      return v.keys().hasOnly(['aata', 'rotiPer5', 'kaatna', 'sabji', 'bartan', 'weekendBartanMultiplier', 'coverBonus'])
+        && v.keys().hasAll(['aata', 'rotiPer5', 'kaatna', 'sabji', 'bartan', 'weekendBartanMultiplier', 'coverBonus'])
+        && numIn(v.aata, 0, 20) && numIn(v.rotiPer5, 0, 20) && numIn(v.kaatna, 0, 20)
+        && numIn(v.sabji, 0, 20) && numIn(v.bartan, 0, 20)
+        && numIn(v.weekendBartanMultiplier, 1, 3) && numIn(v.coverBonus, 0, 10);
+    }
+    match /proposals/{pid} {
+      allow read: if isMember();
+      allow create: if isMember() && ownsNew()
+        && request.resource.data.keys().hasOnly(['userId', 'values', 'basedOn', 'note', 'date', 'lastAuditId'])
+        && validValues(request.resource.data.values)
+        && request.resource.data.basedOn == get(/databases/$(database)/documents/settings/points).data.version
+        && request.resource.data.note is string && request.resource.data.note.size() <= 200
+        && isDate(request.resource.data.date)
+        && auditedCreate('proposals', pid);
+      allow update, delete: if false;
+    }
+    // id = "<proposalId>_<uid>" so each person votes once per proposal, from their own login.
+    match /votes/{voteId} {
+      allow read: if isMember();
+      allow create: if isMember() && ownsNew()
+        && request.resource.data.keys().hasOnly(['userId', 'proposalId', 'approve', 'date', 'lastAuditId'])
+        && voteId == request.resource.data.proposalId + '_' + request.auth.uid
+        && exists(/databases/$(database)/documents/proposals/$(request.resource.data.proposalId))
+        && request.resource.data.approve is bool
+        && isDate(request.resource.data.date)
+        && auditedCreate('votes', voteId);
+      allow update, delete: if false;
+    }
+    function approved(pid, u) {
+      return getAfter(/databases/$(database)/documents/votes/$(pid + '_' + u)).data.approve == true;
+    }
+    // Shared settings: anyone may APPLY a proposal, but only exactly as voted, only with
+    // 3 distinct approving votes, and only on top of the version it was proposed against.
+    match /settings/{sid} {
+      allow read: if isMember();
+      allow create, delete: if false;
+      allow update: if isMember() && sid == 'points' && ownsNew()
+        && request.resource.data.keys().hasOnly(['values', 'version', 'proposalId', 'approvers', 'userId', 'lastAuditId'])
+        && request.resource.data.version == resource.data.version + 1
+        && get(/databases/$(database)/documents/proposals/$(request.resource.data.proposalId)).data.basedOn == resource.data.version
+        && request.resource.data.values == get(/databases/$(database)/documents/proposals/$(request.resource.data.proposalId)).data.values
+        && request.resource.data.approvers is list
+        && request.resource.data.approvers.size() == 3
+        && request.resource.data.approvers.toSet().size() == 3
+        && request.resource.data.approvers.hasOnly(['shiv', 'chavi', 'upasana', 'shristi', 'payal'])
+        && approved(request.resource.data.proposalId, request.resource.data.approvers[0])
+        && approved(request.resource.data.proposalId, request.resource.data.approvers[1])
+        && approved(request.resource.data.proposalId, request.resource.data.approvers[2])
+        && auditedUpdate('settings', sid);
+    }
+
+    // ---------- append-only audit log ----------
+    match /audit/{auditId} {
+      allow read: if isMember();
+      allow create: if isMember() && ownsNew()
+        && request.resource.data.keys().hasOnly(['userId', 'coll', 'docId', 'action', 'before', 'after', 'at', 'date'])
+        && request.resource.data.coll in ['members', 'entries', 'swaps', 'swapReplies', 'flags', 'proposals', 'votes', 'settings']
+        && request.resource.data.docId is string
+        && request.resource.data.action is string && request.resource.data.action.size() <= 200
+        && request.resource.data.at == request.time
+        && isDate(request.resource.data.date)
+        // the target document must be written in the same batch and point back at this record
+        && getAfter(/databases/$(database)/documents/$(request.resource.data.coll)/$(request.resource.data.docId)).data.lastAuditId == auditId;
+      allow update, delete: if false;
+    }
+
+    // Everything else is closed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

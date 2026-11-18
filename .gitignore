@@ -1,0 +1,19 @@
+# NEVER commit PINs or admin keys
+scripts/pins.json
+scripts/serviceAccount.json
+*serviceAccount*.json
+
+node_modules
+dist
+dev-dist
+.env
+.env.local
+.firebase
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+.DS_Store
+
+# local editor/tool config
+.claude
+.vscode
